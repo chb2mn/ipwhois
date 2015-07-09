@@ -38,7 +38,7 @@ else:
                         IPNetwork as ip_network,
                         summarize_address_range,
                         collapse_address_list as collapse_addresses)
-
+import parsers
 import socket
 import dns.resolver
 import re
@@ -845,7 +845,7 @@ class IPWhois:
         return ret
 
     def lookup(self, inc_raw=False, retry_count=3, get_referral=False,
-               extra_blacklist=None, ignore_referral_errors=False):
+               extra_blacklist=None, ignore_referral_errors=False, filename=None):
         """
         The function for retrieving and parsing whois information for an IP
         address via port 43 (WHOIS).
@@ -880,6 +880,50 @@ class IPWhois:
                 informaion is added in the server and port keys. (Dictionary)
             :raw_referral: Raw referral whois results if the inc_raw parameter
                 is True. (String)
+        """
+        # Create the return dictionary.
+        results = {
+            'query': self.address_str,
+            'nets': [],
+            'raw': None,
+            'referral': None,
+            'raw_referral': None
+        }
+        
+        file_data = None 
+        file_registry = None
+
+        if filename != None:
+            fin = open(filename, 'rb')
+            file_data = fin.readlines()
+            
+            #we only need the first 4 lines to figure out 
+            for i in range(4):
+                line = file_data[i]
+                if re.search(r"arin", line, re.IGNORECASE):
+                    file_registry = "arin"
+                    break
+                if re.search(r"ripe", line, re.IGNORECASE):
+                    file_registry = "ripe"
+                    break
+                if re.search(r"apnic", line, re.IGNORECASE):
+                    file_registry = "apnic"
+                    break
+                if re.search(r"afrinic", line, re.IGNORECASE):
+                    file_registry = "afrinic"
+                    break
+                if re.search(r"lacnic", line, re.IGNORECASE):
+                    file_registry = "lacnic"
+                    break
+                if re.search(r"jpnic", line, re.IGNORECASE):
+                    file_registry = "jpnic"
+                    break
+                if re.search(r"korean", line, re.IGNORECASE):
+                    file_registry = "krnic"
+                    break
+
+        """
+            We are still going to check CYMRU in case there is a difference and parse both responses if there is
         """
 
         # Initialize the whois response.
@@ -935,17 +979,12 @@ class IPWhois:
 
                     asn_data['asn_registry'] = 'arin'
 
-        # Create the return dictionary.
-        results = {
-            'query': self.address_str,
-            'nets': [],
-            'raw': None,
-            'referral': None,
-            'raw_referral': None
-        }
-
+        
         # Add the ASN information to the return dictionary.
         results.update(asn_data)
+
+        if results['asn_registry'] is not None and results['asn_registry'] != file_registry:
+            run_both = True #This will signify that because the registries are different, we need to parse both files
 
         # The referral server and port. Only used if get_referral is True.
         referral_server = None
@@ -1031,135 +1070,20 @@ class IPWhois:
 
             results['raw'] = response
 
+        #Do the parsing
         nets = []
 
         if results['asn_registry'] == 'arin':
 
-            # Find the first NetRange value.
-            pattern = re.compile(
-                r'^NetRange:[^\S\n]+(.+)$',
-                re.MULTILINE
-            )
-            temp = pattern.search(response)
-            net_range = None
-            net_range_start = None
-            if temp is not None:
-                net_range = temp.group(1).strip()
-                net_range_start = temp.start()
-
-            # Iterate through all of the networks found, storing the CIDR value
-            # and the start and end positions.
-            for match in re.finditer(
-                r'^CIDR:[^\S\n]+(.+?,[^\S\n].+|.+)$',
-                response,
-                re.MULTILINE
-            ):
-
-                try:
-
-                    net = copy.deepcopy(BASE_NET)
-
-                    if len(nets) > 0:
-                        temp = pattern.search(response, match.start())
-                        net_range = None
-                        net_range_start = None
-                        if temp is not None:
-                            net_range = temp.group(1).strip()
-                            net_range_start = temp.start()
-
-                    if net_range is not None:
-                        if net_range_start < match.start() or len(nets) > 0:
-                            net['range'] = net_range
-
-                    net['cidr'] = ', '.join(
-                        [ip_network(c.strip()).__str__()
-                         for c in match.group(1).split(', ')]
-                    )
-                    net['start'] = match.start()
-                    net['end'] = match.end()
-                    nets.append(net)
-
-                except ValueError:
-
-                    pass
+            nets = parsers.parse_arin(response)
 
         elif results['asn_registry'] == 'lacnic':
 
-            # Iterate through all of the networks found, storing the CIDR value
-            # and the start and end positions.
-            for match in re.finditer(
-                r'^(inetnum|inet6num|route):[^\S\n]+(.+?,[^\S\n].+|.+)$',
-                response,
-                re.MULTILINE
-            ):
-
-                try:
-
-                    net = copy.deepcopy(BASE_NET)
-                    net['range'] = match.group(2).strip()
-
-                    temp = []
-                    for addr in match.group(2).strip().split(', '):
-
-                        count = addr.count('.')
-                        if count is not 0 and count < 4:
-
-                            addr_split = addr.strip().split('/')
-                            for i in range(count + 1, 4):
-                                addr_split[0] += '.0'
-
-                            addr = '/'.join(addr_split)
-
-                        temp.append(ip_network(addr.strip()).__str__())
-
-                    net['cidr'] = ', '.join(temp)
-                    net['start'] = match.start()
-                    net['end'] = match.end()
-                    nets.append(net)
-
-                except ValueError:
-
-                    pass
+            nets = parsers.parse_lacnic(response)
 
         else:
 
-            # Iterate through all of the networks found, storing the CIDR value
-            # and the start and end positions.
-            for match in re.finditer(
-                r'^(inetnum|inet6num|route):[^\S\n]+((.+?)[^\S\n]-[^\S\n](.+)|'
-                    '.+)$',
-                response,
-                re.MULTILINE
-            ):
-
-                try:
-
-                    net = copy.deepcopy(BASE_NET)
-                    net['range'] = match.group(2)
-
-                    if match.group(3) and match.group(4):
-
-                        addrs = []
-                        addrs.extend(summarize_address_range(
-                            ip_address(match.group(3).strip()),
-                            ip_address(match.group(4).strip())))
-
-                        cidr = ', '.join(
-                            [i.__str__() for i in collapse_addresses(addrs)]
-                        )
-
-                    else:
-
-                        cidr = ip_network(match.group(2).strip()).__str__()
-
-                    net['cidr'] = cidr
-                    net['start'] = match.start()
-                    net['end'] = match.end()
-                    nets.append(net)
-
-                except (ValueError, TypeError):
-
-                    pass
+            nets = parsers.parse_ripe(response)
 
         # Iterate through all of the network sections and parse out the
         # appropriate fields for each.
